@@ -1,0 +1,35 @@
+# Local environment settings and credentials
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+
+# Local databases, SQLite companion files, and database backup copies
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite-*
+*.sqlite.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+
+# Runtime data and backups (also covers extensionless databases)
+data/
+backups/
+
+# Local Python environment and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Operational logs
+logs/
+*.log
+
+# OS-generated files
+.DS_Store
+Thumbs.db

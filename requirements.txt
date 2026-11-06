@@ -1,0 +1,3 @@
+# Python 3.10 or newer. Direct dependencies are pinned for this starter.
+discord.py==2.7.1
+python-dotenv==1.2.4
