@@ -1,4 +1,4 @@
-# RP Activity Bot — Discord setup
+# reaper-bot — Discord setup
 
 This stage gets the bot connected to a test server and prepares the project for
 GitHub. The activity rule checker is paused. This starter logs in, prints the
