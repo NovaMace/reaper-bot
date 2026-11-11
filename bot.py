@@ -5,8 +5,9 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 
 import discord
-from dotenv import load_dotenv
+from discord import app_commands
 
+from dotenv import load_dotenv
 
 # --------------------------------------------------
 # LOAD CONFIG
@@ -34,6 +35,7 @@ OOC_CATEGORY_IDS = {
     for value in os.getenv("OOC_CATEGORY_IDS", "").split(",")
     if value.strip()
 }
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID"))
 
 # HARD CODED NUMBERS
 OOC_REQUIRED_POSTS = 5
@@ -47,6 +49,7 @@ intents.members = True
 intents.message_content = True
 
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 
 # --------------------------------------------------
@@ -675,52 +678,6 @@ def show_activity_lists():
 # DISCORD EVENTS
 # --------------------------------------------------
 
-@client.event
-async def on_ready():
-    print(f"Connected as {client.user}.")
-
-    setup_database()
-    mark_all_members_inactive()
-
-    if client.guilds:
-
-        for guild in client.guilds:
-
-            print(f"Server: {guild.name} (ID: {guild.id})")
-            print(f"Members found: {guild.member_count}")
-
-            for member in guild.members:
-                if member.bot:
-                    continue
-
-                print(
-                    f"{member.name} | "
-                    f"ID: {member.id} | "
-                )
-
-                save_member(member)
-        show_inactive_members()
-        #print(f"IC categories: {IC_CATEGORY_IDS}")
-        #print(f"OOC categories: {OOC_CATEGORY_IDS}")
-        #print(f"Character Sheet channel: {CS_CHANNEL_ID}")
-        #print(f"Admin channel: {ADMIN_CHANNEL_ID}")
-
-    else:
-        print("No servers found.")
-
-     # This is a temp manual scan comment out once finished
-    for guild in client.guilds:
-            await initial_scan_ic(guild)
-            await initial_scan_ooc(guild)
-            await initial_scan_character_sheets(guild)
-
-            #show_member_classifications()
-            #show_activity_lists()
-            await send_activity_report()
-
-    print("REAPER is ready. Press Ctrl+C to stop.")
-
-
 # --------------------------------------------------
 # CLASSIFY MESSAGES
 # --------------------------------------------------
@@ -781,6 +738,77 @@ async def on_message(message):
         f"Channel: {message.channel.name}"
     )
 
+# --------------------------------------------------
+# SLASH COMMANDS
+# --------------------------------------------------
+
+@tree.command(
+    name="activity_report",
+    description="Generate the current REAPER activity report",
+    guild=discord.Object(id=TEST_GUILD_ID)
+)
+async def activity_report(interaction: discord.Interaction):
+
+    await send_activity_report()
+
+    await interaction.response.send_message(
+        "REAPER activity report generated.",
+        ephemeral=True
+    )
+
+
+# --------------------------------------------------
+# ON READY EVENT
+# --------------------------------------------------
+@client.event
+async def on_ready():
+    print(f"Connected as {client.user}.")
+
+    setup_database()
+    mark_all_members_inactive()
+
+    if client.guilds:
+
+        for guild in client.guilds:
+
+            print(f"Server: {guild.name} (ID: {guild.id})")
+            print(f"Members found: {guild.member_count}")
+
+            for member in guild.members:
+                if member.bot:
+                    continue
+
+                print(
+                    f"{member.name} | "
+                    f"ID: {member.id} | "
+                )
+
+                save_member(member)
+        show_inactive_members()
+        #print(f"IC categories: {IC_CATEGORY_IDS}")
+        #print(f"OOC categories: {OOC_CATEGORY_IDS}")
+        #print(f"Character Sheet channel: {CS_CHANNEL_ID}")
+        #print(f"Admin channel: {ADMIN_CHANNEL_ID}")
+
+    else:
+        print("No servers found.")
+
+     # This is a temp manual scan comment out once finished
+    for guild in client.guilds:
+            await initial_scan_ic(guild)
+            await initial_scan_ooc(guild)
+            await initial_scan_character_sheets(guild)
+
+            #show_member_classifications()
+            #show_activity_lists()
+            #await send_activity_report()
+
+            await tree.sync(
+                guild=discord.Object(id=TEST_GUILD_ID)
+            )
+
+
+    print("REAPER is ready. Press Ctrl+C to stop.")
 
 
 
