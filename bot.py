@@ -37,6 +37,14 @@ OOC_CATEGORY_IDS = {
 }
 TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID"))
 
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "").strip()
+
+if not ADMIN_ROLE_NAME:
+    raise SystemExit(
+        "Set ADMIN_ROLE_NAME in your .env file, for example: admin."
+    )
+
+
 # HARD CODED NUMBERS
 OOC_REQUIRED_POSTS = 5
 
@@ -51,6 +59,24 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+
+# --------------------------------------------------
+# GET ADMIN ROLE SO ONLY ADMIN CAN USE SLASH COMMANDS
+# --------------------------------------------------
+def is_approved_admin(interaction: discord.Interaction) -> bool:
+    # Only accept requests from our configured server.
+    if interaction.guild_id != TEST_GUILD_ID:
+        return False
+
+    # Ignore requests that do not come from a server member.
+    if not isinstance(interaction.user, discord.Member):
+        return False
+
+    # Check whether any of this member's roles matches the name.
+    return any(
+        role.name.casefold() == ADMIN_ROLE_NAME.casefold()
+        for role in interaction.user.roles
+    )
 
 # --------------------------------------------------
 # DATABASE SETUP
@@ -748,12 +774,41 @@ async def on_message(message):
     guild=discord.Object(id=TEST_GUILD_ID)
 )
 async def activity_report(interaction: discord.Interaction):
+    # Check authorization before building or posting anything.
+    if not is_approved_admin(interaction):
+        await interaction.response.send_message(
+            "You are not authorized to use REAPER commands here.",
+            ephemeral=True
+        )
+        return
 
-    await send_activity_report()
+    # Acknowledge the request before generating the report.
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True
+    )
 
-    await interaction.response.send_message(
-        "REAPER activity report generated.",
-        ephemeral=True
+    try:
+        await send_activity_report()
+
+    except (discord.HTTPException, sqlite3.Error, RuntimeError) as error:
+        print(
+            f"Activity report failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+        await interaction.edit_original_response(
+            content=(
+                "REAPER could not send the report. "
+                "Check the terminal for the error."
+            )
+        )
+        return
+
+    await interaction.edit_original_response(
+        content=(
+            f"REAPER activity report posted "
+        )
     )
 
 
