@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -22,6 +23,10 @@ if not token:
         "Missing DISCORD_BOT_TOKEN. "
         "Check your local .env file."
     )
+
+# --------------------------------------------------
+# VARIABLES
+# --------------------------------------------------
 CS_CHANNEL_ID = int(os.getenv("CS_CHANNEL_ID"))
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 IC_CATEGORY_IDS = {
@@ -47,6 +52,9 @@ if not ADMIN_ROLE_NAME:
 
 # HARD CODED NUMBERS
 OOC_REQUIRED_POSTS = 5
+
+ACTIVITY_SCAN_OK = {"IC": False, "OOC": False}
+ACTIVITY_SCAN_LOCK = asyncio.Lock()
 
 # --------------------------------------------------
 # DISCORD INTENTS
@@ -264,6 +272,37 @@ def show_inactive_members():
         )
     connection.close()
 
+
+# --------------------------------------------------
+# Scanner Helper Function
+# --------------------------------------------------
+def get_activity_kind(channel):
+    # Threads use their parent text/forum channel's category.
+    parent = (
+        channel.parent
+        if isinstance(channel, discord.Thread)
+        else channel
+    )
+
+    if not isinstance(
+        parent,
+        (discord.TextChannel, discord.ForumChannel)
+    ):
+        return None
+
+    # Sheets and admin reports must not count as IC/OOC activity.
+    if parent.id in (CS_CHANNEL_ID, ADMIN_CHANNEL_ID):
+        return None
+
+    if parent.category_id in IC_CATEGORY_IDS:
+        return "IC"
+
+    if parent.category_id in OOC_CATEGORY_IDS:
+        return "OOC"
+
+    return None
+
+
 # --------------------------------------------------
 # IC CHARACTER COUNT
 # --------------------------------------------------
@@ -293,30 +332,34 @@ def qualifies_ic_message(content):
 
 def save_ic_activity(message):
     connection = sqlite3.connect("reaper.db")
-    cursor = connection.cursor()
 
-    cursor.execute("""
-        INSERT INTO ic_activity (
-            discord_id,
-            message_id,
-            channel_id,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
+    try:
+        connection.execute("""
+            INSERT INTO ic_activity (
+                discord_id,
+                message_id,
+                channel_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
 
-        ON CONFLICT(discord_id) DO UPDATE SET
-            message_id = excluded.message_id,
-            channel_id = excluded.channel_id,
-            created_at = excluded.created_at
-    """, (
-        message.author.id,
-        message.id,
-        message.channel.id,
-        message.created_at.isoformat()
-    ))
+            ON CONFLICT(discord_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                channel_id = excluded.channel_id,
+                created_at = excluded.created_at
 
-    connection.commit()
-    connection.close()
+            WHERE excluded.message_id > ic_activity.message_id
+        """, (
+            message.author.id,
+            message.id,
+            message.channel.id,
+            message.created_at.isoformat()
+        ))
+
+        connection.commit()
+
+    finally:
+        connection.close()
 
 # --------------------------------------------------
 # GET IC MESSAGE AGE
@@ -534,50 +577,19 @@ def format_activity_report():
 # INITIAL SCANS
 # --------------------------------------------------
 async def initial_scan_ic(guild):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=42)
-
-    print("Starting initial IC scan...")
-
-    for channel in guild.text_channels:
-        if channel.category_id not in IC_CATEGORY_IDS:
-            continue
-
-        print(f"Scanning IC channel: {channel.name}")
-
-        async for message in channel.history(
-            after=cutoff,
-            oldest_first=True
-        ):
-            if message.author.bot:
-                continue
-
-            if qualifies_ic_message(message.content):
-                save_ic_activity(message)
-
-    print("Initial IC scan complete.")
+    return await scan_activity_history(
+        guild,
+        kind="IC",
+        days=42
+    )
 
 
 async def initial_scan_ooc(guild):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-
-    print("Starting initial OOC scan...")
-
-    for channel in guild.text_channels:
-        if channel.category_id not in OOC_CATEGORY_IDS:
-            continue
-
-        print(f"Scanning OOC channel: {channel.name}")
-
-        async for message in channel.history(
-            after=cutoff,
-            oldest_first=True
-        ):
-            if message.author.bot:
-                continue
-
-            save_ooc_activity(message)
-
-    print("Initial OOC scan complete.")
+    return await scan_activity_history(
+        guild,
+        kind="OOC",
+        days=14
+    )
 
 
 async def initial_scan_character_sheets(guild):
@@ -700,6 +712,196 @@ def show_activity_lists():
 
     print("===========================\n")
 
+
+# --------------------------------------------------
+# HANDLES BOTH IC AND OOC HISTORIES
+# --------------------------------------------------
+async def scan_activity_history(guild, kind, days):
+    async with ACTIVITY_SCAN_LOCK:
+        ACTIVITY_SCAN_OK[kind] = False
+        location = "scan setup"
+
+        scan_started = datetime.now(timezone.utc)
+        cutoff = scan_started - timedelta(days=days)
+
+        try:
+            # Check that we are scanning the configured server.
+            if guild.id != TEST_GUILD_ID:
+                raise RuntimeError(
+                    "Scan requested for the wrong server."
+                )
+
+            if guild.me is None:
+                raise RuntimeError(
+                    "REAPER's server membership is unavailable."
+                )
+
+            if IC_CATEGORY_IDS & OOC_CATEGORY_IDS:
+                raise RuntimeError(
+                    "A category is configured as both IC and OOC."
+                )
+
+            category_ids = (
+                IC_CATEGORY_IDS
+                if kind == "IC"
+                else OOC_CATEGORY_IDS
+            )
+
+            if not category_ids:
+                raise RuntimeError(
+                    f"No {kind} categories configured."
+                )
+
+            for category_id in category_ids:
+                category = guild.get_channel(category_id)
+
+                if not isinstance(category, discord.CategoryChannel):
+                    raise RuntimeError(
+                        f"Category {category_id} was not found."
+                    )
+
+            # Find the relevant text channels and forum containers.
+            parents = {
+                channel.id: channel
+                for channel in guild.channels
+                if get_activity_kind(channel) == kind
+            }
+
+            if not parents:
+                raise RuntimeError(
+                    f"No {kind} text/forum channels found."
+                )
+
+            # A source is a place with an actual message history.
+            sources = {}
+
+            for parent in parents.values():
+                location = f"{parent.name} ({parent.id})"
+                permissions = parent.permissions_for(guild.me)
+
+                if not (
+                    permissions.view_channel
+                    and permissions.read_message_history
+                ):
+                    raise RuntimeError(
+                        "Missing View Channel or Read Message History."
+                    )
+
+                # Normal text channels have their own history.
+                # Forum containers do not.
+                if isinstance(parent, discord.TextChannel):
+                    sources[parent.id] = parent
+
+            # Find accessible active threads, regardless of their age.
+            location = "active thread discovery"
+
+            for thread in await guild.active_threads():
+                if thread.parent_id in parents:
+                    sources[thread.id] = thread
+
+            # Find archived threads and forum posts.
+            # Do NOT filter these by their creation date.
+            for parent in parents.values():
+                location = (
+                    f"archived threads in {parent.name} ({parent.id})"
+                )
+
+                print(
+                    f"{kind}: discovering threads in {parent.name}"
+                )
+
+                async for thread in parent.archived_threads(
+                    limit=None
+                ):
+                    sources[thread.id] = thread
+
+                # Also include archived private threads REAPER joined.
+                # Private threads belong to normal text channels.
+                if (
+                    isinstance(parent, discord.TextChannel)
+                    and not parent.is_news()
+                ):
+                    async for thread in parent.archived_threads(
+                        limit=None,
+                        private=True,
+                        joined=True
+                    ):
+                        sources[thread.id] = thread
+
+            # Catch threads unarchived while discovery was running.
+            location = "active thread recheck"
+
+            for thread in await guild.active_threads():
+                if thread.parent_id in parents:
+                    sources[thread.id] = thread
+
+            # Read recent messages from each discovered source.
+            processed = 0
+
+            for source in sources.values():
+                location = f"{source.name} ({source.id})"
+                permissions = source.permissions_for(guild.me)
+
+                if not (
+                    permissions.view_channel
+                    and permissions.read_message_history
+                ):
+                    raise RuntimeError(
+                        "Cannot read this message history."
+                    )
+
+                print(f"Scanning {kind}: {location}")
+
+                async for message in source.history(
+                    limit=None,
+                    after=cutoff,
+                    before=scan_started,
+                    oldest_first=True
+                ):
+                    if (
+                        message.author.bot
+                        or message.webhook_id is not None
+                    ):
+                        continue
+
+                    # Ignore Discord system notices.
+                    if message.is_system():
+                        continue
+
+                    if kind == "IC":
+                        if not qualifies_ic_message(message.content):
+                            continue
+
+                        save_ic_activity(message)
+
+                    else:
+                        # OOC remains unqualified logging for now.
+                        save_ooc_activity(message)
+
+                    processed += 1
+
+            ACTIVITY_SCAN_OK[kind] = True
+
+            print(
+                f"{kind} scan complete: "
+                f"{len(sources)} histories checked; "
+                f"{processed} messages processed."
+            )
+
+            return True
+
+        except (
+            discord.HTTPException,
+            discord.ClientException,
+            sqlite3.Error,
+            RuntimeError
+        ) as error:
+            print(
+                f"{kind} SCAN INCOMPLETE at {location}: {error}"
+            )
+
+            return False
+
 # --------------------------------------------------
 # DISCORD EVENTS
 # --------------------------------------------------
@@ -709,13 +911,37 @@ def show_activity_lists():
 # --------------------------------------------------
 
 @client.event
+@client.event
 async def on_message(message):
-    # Ignore REAPER's own messages and other bots
-    if message.author.bot:
+    # Ignore direct messages and other servers.
+    if message.guild is None:
         return
 
-    # Character Sheet channel
-    if message.channel.id == CS_CHANNEL_ID:
+    if message.guild.id != TEST_GUILD_ID:
+        return
+
+    if (
+        message.author.bot
+        or message.webhook_id is not None
+        or message.is_system()
+    ):
+        return
+
+    parent = (
+        message.channel.parent
+        if isinstance(message.channel, discord.Thread)
+        else message.channel
+    )
+
+    if parent is None:
+        print(
+            f"Cannot classify message {message.id}: "
+            f"thread parent unavailable."
+        )
+        return
+
+    # Keep character-sheet discussions separate.
+    if parent.id == CS_CHANNEL_ID:
         print(
             f"CHARACTER SHEET | "
             f"{message.author.name} | "
@@ -723,46 +949,33 @@ async def on_message(message):
         )
         return
 
-    # IC category
-    if message.channel.category_id in IC_CATEGORY_IDS:
-        character_count = count_ic_characters(message.content)
+    kind = get_activity_kind(message.channel)
 
+    if kind == "IC":
         if qualifies_ic_message(message.content):
-
             save_ic_activity(message)
 
             print(
-                f"IC QUALIFIES | "
+                f"IC LOGGED | "
                 f"{message.author.name} | "
-                f"Channel: {message.channel.name}"
+                f"Channel/thread: {message.channel.name}"
             )
+
         else:
             print(
-                f"TOO SHORT | "
+                f"IC TOO SHORT | "
                 f"{message.author.name} | "
-                f"Channel: {message.channel.name}"
+                f"Channel/thread: {message.channel.name}"
             )
-        return
 
-    # OOC category
-    if message.channel.category_id in OOC_CATEGORY_IDS:
-
+    elif kind == "OOC":
         save_ooc_activity(message)
 
         print(
-                f"OOC QUALIFIES | "
-                f"{message.author.name} | "
-                f"Channel: {message.channel.name}"
+            f"OOC LOGGED | "
+            f"{message.author.name} | "
+            f"Channel/thread: {message.channel.name}"
         )
-
-        return
-
-    # Everything else
-    print(
-        f"OTHER | "
-        f"{message.author.name} | "
-        f"Channel: {message.channel.name}"
-    )
 
 # --------------------------------------------------
 # SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
@@ -813,6 +1026,12 @@ def split_report(report: str, limit: int = 1900) -> list[str]:
 # SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
 # --------------------------------------------------
 async def send_activity_report():
+    if not all(ACTIVITY_SCAN_OK.values()):
+        raise RuntimeError(
+            "The IC/OOC baseline is incomplete or still scanning. "
+            "Check the startup scan messages before requesting a report."
+        )
+
     channel = client.get_channel(ADMIN_CHANNEL_ID)
 
     if not isinstance(channel, discord.TextChannel):
