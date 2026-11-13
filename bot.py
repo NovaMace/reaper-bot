@@ -765,6 +765,94 @@ async def on_message(message):
     )
 
 # --------------------------------------------------
+# SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
+# --------------------------------------------------
+def split_report(report: str, limit: int = 1900) -> list[str]:
+    if not 2 <= limit <= 1900:
+        raise ValueError(
+            "The report chunk limit must be between 2 and 1900."
+        )
+
+    chunks = []
+    current = ""
+    current_size = 0
+
+    for line in report.splitlines(keepends=True):
+        line_size = len(line.encode("utf-16-le")) // 2
+
+        # Start a new part if adding this line would exceed the limit.
+        if current and current_size + line_size > limit:
+            if current.strip():
+                chunks.append(current)
+
+            current = ""
+            current_size = 0
+
+        # This also handles an unusually long individual line.
+        for character in line:
+            character_size = len(character.encode("utf-16-le")) // 2
+
+            if current_size + character_size > limit:
+                if current.strip():
+                    chunks.append(current)
+
+                current = ""
+                current_size = 0
+
+            current += character
+            current_size += character_size
+
+    # Keep the final part.
+    if current.strip():
+        chunks.append(current)
+
+    return chunks
+
+
+# --------------------------------------------------
+# SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
+# --------------------------------------------------
+async def send_activity_report():
+    channel = client.get_channel(ADMIN_CHANNEL_ID)
+
+    if not isinstance(channel, discord.TextChannel):
+        raise RuntimeError(
+            "ADMIN_CHANNEL_ID must point to an available text channel."
+        )
+
+    if channel.guild.id != TEST_GUILD_ID:
+        raise RuntimeError(
+            "The admin channel is not in TEST_GUILD_ID."
+        )
+
+    report = format_activity_report()
+    parts = split_report(report)
+
+    if not parts:
+        raise RuntimeError("The activity report is empty.")
+
+    total_parts = len(parts)
+    sent = 0
+
+    try:
+        for part_number, part in enumerate(parts, start=1):
+            await channel.send(
+                f"REAPER report — part {part_number}/{total_parts}\n\n"
+                f"{part}",
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+            sent += 1
+
+    except discord.HTTPException as error:
+        raise RuntimeError(
+            f"Report incomplete: {sent}/{total_parts} parts sent. "
+            f"Check the admin channel before retrying. {error}"
+        ) from error
+
+    print(f"Activity report sent in {sent} message(s).")
+
+# --------------------------------------------------
 # SLASH COMMANDS
 # --------------------------------------------------
 
