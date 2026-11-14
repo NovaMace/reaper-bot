@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
+from reaper_ooc_scan import scan_ooc
 
 from dotenv import load_dotenv
 
@@ -52,6 +54,7 @@ if not ADMIN_ROLE_NAME:
 
 # HARD CODED NUMBERS
 OOC_REQUIRED_POSTS = 5
+OOC_LAST_CHECKED = None
 
 ACTIVITY_SCAN_OK = {"IC": False, "OOC": False}
 ACTIVITY_SCAN_LOCK = asyncio.Lock()
@@ -540,6 +543,18 @@ def format_activity_report():
     lines.append("=== REAPER ROLE CALL ===")
     lines.append("")
 
+    #Keep this for now, removed once tested
+    if OOC_LAST_CHECKED is not None:
+        lines.append(
+            "OOC checked through (UTC): "
+            f"{OOC_LAST_CHECKED:%Y-%m-%d %H:%M}"
+        )
+
+    lines.append(
+        f"OOC counts use raw messages and are capped "
+        f"at {OOC_REQUIRED_POSTS}+."
+    )
+
     lines.append("PURGE")
     if purge_list:
         for member in purge_list:
@@ -585,11 +600,54 @@ async def initial_scan_ic(guild):
 
 
 async def initial_scan_ooc(guild):
-    return await scan_activity_history(
-        guild,
-        kind="OOC",
-        days=14
-    )
+    global OOC_LAST_CHECKED
+
+    async with ACTIVITY_SCAN_LOCK:
+        ACTIVITY_SCAN_OK["OOC"] = False
+
+        try:
+            if guild.id != TEST_GUILD_ID:
+                raise RuntimeError(
+                    "Wrong server for the OOC scan."
+                )
+
+            if IC_CATEGORY_IDS & OOC_CATEGORY_IDS:
+                raise RuntimeError(
+                    "IC and OOC categories must not overlap."
+                )
+
+            result = await scan_ooc(
+                guild=guild,
+                db_path="reaper.db",
+                category_ids=OOC_CATEGORY_IDS,
+                excluded_channel_ids={
+                    CS_CHANNEL_ID,
+                    ADMIN_CHANNEL_ID
+                },
+                keep_posts=OOC_REQUIRED_POSTS,
+            )
+
+        except (
+            discord.HTTPException,
+            discord.ClientException,
+            sqlite3.Error,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            print(f"OOC SCAN INCOMPLETE: {error}")
+            return False
+
+        OOC_LAST_CHECKED = result["checked_through"]
+        ACTIVITY_SCAN_OK["OOC"] = True
+
+        print(
+            f"OOC check complete | "
+            f"Histories: {result['histories']} | "
+            f"Messages examined: {result['processed']} | "
+            f"Stored records: {result['stored']}"
+        )
+
+        return True
 
 
 async def initial_scan_character_sheets(guild):
@@ -641,6 +699,10 @@ async def initial_scan_character_sheets(guild):
 async def send_activity_report():
     channel = client.get_channel(ADMIN_CHANNEL_ID)
 
+    if not all(ACTIVITY_SCAN_OK.values()):
+        raise RuntimeError(
+            "Activity scans are incomplete or still running."
+        )
     if channel is None:
         print("Admin report channel not found.")
         return
@@ -968,14 +1030,28 @@ async def on_message(message):
                 f"Channel/thread: {message.channel.name}"
             )
 
-    elif kind == "OOC":
-        save_ooc_activity(message)
 
-        print(
-            f"OOC LOGGED | "
-            f"{message.author.name} | "
-            f"Channel/thread: {message.channel.name}"
-        )
+    elif kind == "OOC":
+        # OOC activity is collected by the hourly history scan.
+        return
+
+    # Character sheets are handled separately from IC/OOC activity.
+    if parent.id == CS_CHANNEL_ID:
+
+        # A direct message in the configured text CS channel.
+        if (
+            isinstance(message.channel, discord.TextChannel)
+            and message.channel.id == CS_CHANNEL_ID
+        ):
+            save_member(message.author)
+            mark_sheet_found(message.author.id)
+
+            print(
+                f"CS FOUND | "
+                f"{message.author.display_name}"
+            )
+
+        return
 
 # --------------------------------------------------
 # SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
@@ -1160,6 +1236,7 @@ async def on_ready():
             await initial_scan_ic(guild)
             await initial_scan_ooc(guild)
             await initial_scan_character_sheets(guild)
+            await initial_scan_ooc(guild)
 
             #show_member_classifications()
             #show_activity_lists()
@@ -1168,11 +1245,27 @@ async def on_ready():
             await tree.sync(
                 guild=discord.Object(id=TEST_GUILD_ID)
             )
-
+    if not hourly_ooc_scan.is_running():
+        hourly_ooc_scan.start()
 
     print("REAPER is ready. Press Ctrl+C to stop.")
 
+# --------------------------------------------------
+# Scans OOC every hour
+# --------------------------------------------------
 
+@tasks.loop(hours=1)
+async def hourly_ooc_scan():
+    await client.wait_until_ready()
+
+    guild = client.get_guild(TEST_GUILD_ID)
+
+    if guild is None:
+        ACTIVITY_SCAN_OK["OOC"] = False
+        print("OOC scan skipped: configured server unavailable.")
+        return
+
+    await initial_scan_ooc(guild)
 
 # --------------------------------------------------
 # STARTS THE BOT MUST BE LAST
