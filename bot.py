@@ -31,6 +31,19 @@ if not token:
 # --------------------------------------------------
 CS_CHANNEL_ID = int(os.getenv("CS_CHANNEL_ID"))
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
+
+EXCLUDED_CHANNEL_IDS = {
+    int(value.strip())
+    for value in os.getenv("EXCLUDED_CHANNEL_IDS", "").split(",")
+    if value.strip()
+}
+
+EXCLUDED_MEMBER_IDS = {
+    int(value.strip())
+    for value in os.getenv("EXCLUDED_MEMBER_IDS", "").split(",")
+    if value.strip()
+}
+
 IC_CATEGORY_IDS = {
     int(value.strip())
     for value in os.getenv("IC_CATEGORY_IDS", "").split(",")
@@ -289,7 +302,9 @@ def show_inactive_members():
 # Scanner Helper Function
 # --------------------------------------------------
 def get_activity_kind(channel):
-    # Threads use their parent text/forum channel's category.
+    """Classify activity while ignoring excluded placeholder channels."""
+
+    # Messages in a thread use the containing text/forum channel.
     parent = (
         channel.parent
         if isinstance(channel, discord.Thread)
@@ -298,13 +313,22 @@ def get_activity_kind(channel):
 
     if not isinstance(
         parent,
-        (discord.TextChannel, discord.ForumChannel)
+        (discord.TextChannel, discord.ForumChannel),
     ):
         return None
 
-    # Sheets and admin reports must not count as IC/OOC activity.
+    # Exclusions take priority over all IC/OOC selections.
+    if parent.id in EXCLUDED_CHANNEL_IDS:
+        return None
+
+    # Character sheets and admin reports are handled separately.
     if parent.id in (CS_CHANNEL_ID, ADMIN_CHANNEL_ID):
         return None
+
+    # An individually selected OOC channel takes precedence
+    # over the category containing it.
+    if parent.id in OOC_CATEGORY_IDS:
+        return "OOC"
 
     if parent.category_id in IC_CATEGORY_IDS:
         return "IC"
@@ -313,8 +337,6 @@ def get_activity_kind(channel):
         return "OOC"
 
     return None
-
-
 # --------------------------------------------------
 # IC CHARACTER COUNT
 # --------------------------------------------------
@@ -569,6 +591,11 @@ def build_activity_lists():
     watch_list = []
 
     for discord_id, username, display_name, joined_at in members:
+
+        # Exempt members from all activity report lists
+        if discord_id in EXCLUDED_MEMBER_IDS:
+            continue
+
         classification, reason = classify_member(discord_id)
 
         if classification is None:
@@ -681,10 +708,10 @@ async def initial_scan_ooc(guild):
                 guild=guild,
                 db_path="reaper.db",
                 category_ids=OOC_CATEGORY_IDS,
-                excluded_channel_ids={
-                    CS_CHANNEL_ID,
-                    ADMIN_CHANNEL_ID
-                },
+                excluded_channel_ids=(
+                        {CS_CHANNEL_ID, ADMIN_CHANNEL_ID}
+                        | EXCLUDED_CHANNEL_IDS
+                ),
                 keep_posts=OOC_REQUIRED_POSTS,
             )
 
@@ -1394,16 +1421,14 @@ async def on_ready():
      # This is a temp manual scan comment out once finished
     for guild in client.guilds:
             await initial_scan_ic(guild)
-            await initial_scan_ooc(guild)
             await initial_scan_character_sheets(guild)
-            await initial_scan_ooc(guild)
 
             #show_member_classifications()
             #show_activity_lists()
             #await send_activity_report()
 
-            await tree.sync(
-                guild=discord.Object(id=TEST_GUILD_ID)
+    await tree.sync(
+        guild=discord.Object(id=TEST_GUILD_ID)
             )
     if not hourly_ooc_scan.is_running():
         hourly_ooc_scan.start()
@@ -1411,7 +1436,7 @@ async def on_ready():
     print("REAPER is ready. Press Ctrl+C to stop.")
 
 # --------------------------------------------------
-# Scans OOC every hour
+# SCAN OOC EVERY HOUR
 # --------------------------------------------------
 
 @tasks.loop(hours=1)
@@ -1422,11 +1447,36 @@ async def hourly_ooc_scan():
 
     if guild is None:
         ACTIVITY_SCAN_OK["OOC"] = False
-        print("OOC scan skipped: configured server unavailable.")
+        print(
+            "OOC scan skipped: configured server unavailable.",
+            flush=True
+        )
         return
 
-    await initial_scan_ooc(guild)
+    completed = await initial_scan_ooc(guild)
 
+    if not completed:
+        print(
+            "OOC scan did not complete successfully. "
+            "Check the error above.",
+            flush=True
+        )
+        return
+
+    if all(ACTIVITY_SCAN_OK.values()):
+        print(
+            "REAPER is ready. IC/OOC baseline checks passed. "
+            "The hourly OOC schedule continues. "
+            "Press Ctrl+C to stop.",
+            flush=True
+        )
+
+    else:
+        print(
+            "OOC scan finished, but the IC baseline is incomplete. "
+            "Check the IC scan messages above.",
+            flush=True
+        )
 # --------------------------------------------------
 # STARTS THE BOT MUST BE LAST
 # --------------------------------------------------
