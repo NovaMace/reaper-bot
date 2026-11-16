@@ -183,6 +183,19 @@ async def scan_ooc(
     try:
         with connection:
             connection.execute("DELETE FROM ooc_activity")
+
+            # A member may have left while message histories were downloading.
+            # Check membership again inside this write transaction so their
+            # deleted activity cannot be restored by this scan.
+            current_member_ids = {
+                row[0] for row in connection.execute(
+                    "SELECT discord_id FROM members WHERE in_server = 1"
+                )
+            }
+            records = [
+                row for row in records if row[1] in current_member_ids
+            ]
+
             connection.executemany("""
                 INSERT INTO ooc_activity
                     (message_id, discord_id, channel_id, created_at)

@@ -213,6 +213,15 @@ def classify_member(discord_id):
     # IC activity
     ic_age = get_ic_age_days(discord_id)
 
+    # Early warning: approaching the standard 14-day IC deadline.
+    if ic_age is not None and 13 <= ic_age < 14:
+        return (
+            "WATCH",
+            "IC DEADLINE APPROACHING: Last qualifying IC post is "
+            "at least 13 but less than 14 days old. "
+        )
+
+    # Everyone else with recent IC activity needs no activity-list entry.
     if ic_age is not None and ic_age < 14:
         return None, None
 
@@ -337,29 +346,32 @@ def save_ic_activity(message):
     connection = sqlite3.connect("reaper.db")
 
     try:
-        connection.execute("""
-            INSERT INTO ic_activity (
-                discord_id,
-                message_id,
-                channel_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
+        with connection:
+            connection.execute("""
+                INSERT INTO ic_activity (
+                    discord_id,
+                    message_id,
+                    channel_id,
+                    created_at
+                )
 
-            ON CONFLICT(discord_id) DO UPDATE SET
-                message_id = excluded.message_id,
-                channel_id = excluded.channel_id,
-                created_at = excluded.created_at
+                SELECT discord_id, ?, ?, ?
+                FROM members
+                WHERE discord_id = ?
+                  AND in_server = 1
 
-            WHERE excluded.message_id > ic_activity.message_id
-        """, (
-            message.author.id,
-            message.id,
-            message.channel.id,
-            message.created_at.isoformat()
-        ))
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    channel_id = excluded.channel_id,
+                    created_at = excluded.created_at
 
-        connection.commit()
+                WHERE excluded.message_id > ic_activity.message_id
+            """, (
+                message.id,
+                message.channel.id,
+                message.created_at.isoformat(),
+                message.author.id
+            ))
 
     finally:
         connection.close()
@@ -481,6 +493,55 @@ def get_member_data(discord_id):
     connection.close()
 
     return row
+
+# --------------------------------------------------
+# CLEANS DEPARTED MEMBER LIST IF BOT RESTARTS
+# -------------------------------------------------
+def cleanup_departed_members(guild):
+    # Do not delete records using an unavailable or incomplete list.
+    if (
+        guild.id != TEST_GUILD_ID
+        or guild.unavailable
+        or not guild.chunked
+    ):
+        print(
+            "Member cleanup skipped: "
+            "complete configured-server member list unavailable."
+        )
+        return
+
+    current_ids = {
+        member.id
+        for member in guild.members
+        if not member.bot
+    }
+
+    connection = sqlite3.connect("reaper.db")
+
+    try:
+        saved_ids = {
+            row[0]
+            for row in connection.execute("""
+                SELECT discord_id FROM members
+                UNION
+                SELECT discord_id FROM ic_activity
+                UNION
+                SELECT discord_id FROM ooc_activity
+            """)
+        }
+
+    finally:
+        connection.close()
+
+    departed_ids = saved_ids - current_ids
+
+    for discord_id in departed_ids:
+        delete_member_records(discord_id)
+
+    print(
+        f"MEMBERSHIP CLEANUP | "
+        f"Removed records for {len(departed_ids)} departed members."
+    )
 
 # --------------------------------------------------
 # BUILDS THE ACTIVITY LIST IN MEMORY
@@ -965,6 +1026,32 @@ async def scan_activity_history(guild, kind, days):
             return False
 
 # --------------------------------------------------
+# DELETE DEPARTED MEMEBR RECORDS
+# --------------------------------------------------
+def delete_member_records(discord_id: int):
+    connection = sqlite3.connect("reaper.db")
+
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM ic_activity WHERE discord_id = ?",
+                (discord_id,)
+            )
+
+            connection.execute(
+                "DELETE FROM ooc_activity WHERE discord_id = ?",
+                (discord_id,)
+            )
+
+            connection.execute(
+                "DELETE FROM members WHERE discord_id = ?",
+                (discord_id,)
+            )
+
+    finally:
+        connection.close()
+
+# --------------------------------------------------
 # DISCORD EVENTS
 # --------------------------------------------------
 
@@ -972,7 +1059,6 @@ async def scan_activity_history(guild, kind, days):
 # CLASSIFY MESSAGES
 # --------------------------------------------------
 
-@client.event
 @client.event
 async def on_message(message):
     # Ignore direct messages and other servers.
@@ -1052,6 +1138,79 @@ async def on_message(message):
             )
 
         return
+
+# --------------------------------------------------
+# HANDLE NEW MEMBERS
+# --------------------------------------------------
+
+@client.event
+async def on_member_join(member: discord.Member):
+    # Only track the configured server.
+    if member.guild.id != TEST_GUILD_ID:
+        return
+
+    # Ignore bot accounts.
+    if member.bot:
+        return
+
+    print(
+        f"JOIN RECEIVED | "
+        f"{member.display_name} | "
+        f"Username: {member.name} | "
+        f"ID: {member.id}",
+        flush=True
+    )
+
+    try:
+        save_member(member)
+
+    except sqlite3.Error as error:
+        print(
+            f"JOIN SAVE FAILED | "
+            f"ID: {member.id} | "
+            f"Error: {error}",
+            flush=True
+        )
+        return
+
+    print(
+        f"MEMBER SAVED | "
+        f"{member.display_name} | "
+        f"Joined server: {member.joined_at}",
+        flush=True
+    )
+
+# --------------------------------------------------
+# REMOVE DEPARTED MEMBERS
+# --------------------------------------------------
+
+@client.event
+async def on_raw_member_remove(
+    payload: discord.RawMemberRemoveEvent
+):
+    if payload.guild_id != TEST_GUILD_ID:
+        return
+
+    if payload.user.bot:
+        return
+
+    try:
+        delete_member_records(payload.user.id)
+
+    except sqlite3.Error as error:
+        print(
+            f"MEMBER CLEANUP FAILED | "
+            f"ID: {payload.user.id} | {error}",
+            flush=True
+        )
+        return
+
+    print(
+        f"MEMBER REMOVED FROM DATABASE | "
+        f"{payload.user.name} | "
+        f"ID: {payload.user.id}",
+        flush=True
+    )
 
 # --------------------------------------------------
 # SPLIT LARGE MESSAGES FOR 2000 CHAR LIMIT
@@ -1222,7 +1381,8 @@ async def on_ready():
                 )
 
                 save_member(member)
-        show_inactive_members()
+        cleanup_departed_members(guild)
+        #show_inactive_members()
         #print(f"IC categories: {IC_CATEGORY_IDS}")
         #print(f"OOC categories: {OOC_CATEGORY_IDS}")
         #print(f"Character Sheet channel: {CS_CHANNEL_ID}")
