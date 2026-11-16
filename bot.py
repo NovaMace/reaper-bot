@@ -632,16 +632,16 @@ def format_activity_report():
     lines.append("")
 
     #Keep this for now, removed once tested
-    if OOC_LAST_CHECKED is not None:
-        lines.append(
-            "OOC checked through (UTC): "
-            f"{OOC_LAST_CHECKED:%Y-%m-%d %H:%M}"
-        )
+    #if OOC_LAST_CHECKED is not None:
+       # lines.append(
+           # "OOC checked through (UTC): "
+           # f"{OOC_LAST_CHECKED:%Y-%m-%d %H:%M}"
+        #)
 
-    lines.append(
-        f"OOC counts use raw messages and are capped "
-        f"at {OOC_REQUIRED_POSTS}+."
-    )
+   # lines.append(
+        #f"OOC counts use raw messages and are capped "
+        #f"at {OOC_REQUIRED_POSTS}+."
+    #)
 
     lines.append("PURGE")
     if purge_list:
@@ -1318,7 +1318,7 @@ async def send_activity_report():
     try:
         for part_number, part in enumerate(parts, start=1):
             await channel.send(
-                f"REAPER report — part {part_number}/{total_parts}\n\n"
+                f"part {part_number}/{total_parts}\n\n"
                 f"{part}",
                 allowed_mentions=discord.AllowedMentions.none()
             )
@@ -1339,7 +1339,7 @@ async def send_activity_report():
 
 @tree.command(
     name="activity_report",
-    description="Generate the current REAPER activity report",
+    description="Generate the current REAPER report",
     guild=discord.Object(id=TEST_GUILD_ID)
 )
 async def activity_report(interaction: discord.Interaction):
