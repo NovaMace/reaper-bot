@@ -64,6 +64,13 @@ if not ADMIN_ROLE_NAME:
         "Set ADMIN_ROLE_NAME in your .env file, for example: admin."
     )
 
+STAFF_ROLE_NAME = os.getenv("STAFF_ROLE_NAME", "").strip()
+
+if not STAFF_ROLE_NAME:
+    raise SystemExit(
+        "Set STAFF_ROLE_NAME in your .env file, for example: staff."
+    )
+
 
 # HARD CODED NUMBERS
 OOC_REQUIRED_POSTS = 5
@@ -88,17 +95,21 @@ tree = app_commands.CommandTree(client)
 # GET ADMIN ROLE SO ONLY ADMIN CAN USE SLASH COMMANDS
 # --------------------------------------------------
 def is_approved_admin(interaction: discord.Interaction) -> bool:
-    # Only accept requests from our configured server.
+    # Only allow commands from the configured server.
     if interaction.guild_id != TEST_GUILD_ID:
         return False
 
-    # Ignore requests that do not come from a server member.
     if not isinstance(interaction.user, discord.Member):
         return False
 
-    # Check whether any of this member's roles matches the name.
+    # Both roles have full access to REAPER commands.
+    allowed_roles = {
+        ADMIN_ROLE_NAME.casefold(),
+        STAFF_ROLE_NAME.casefold()
+    }
+
     return any(
-        role.name.casefold() == ADMIN_ROLE_NAME.casefold()
+        role.name.casefold() in allowed_roles
         for role in interaction.user.roles
     )
 
@@ -140,6 +151,18 @@ def setup_database():
             created_at TEXT NOT NULL
         )
     """)
+
+    # Add character-sheet submission date to existing databases.
+    columns = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(members)")
+    }
+
+    if "sheet_submitted_at" not in columns:
+        cursor.execute("""
+            ALTER TABLE members
+            ADD COLUMN sheet_submitted_at TEXT
+        """)
 
     connection.commit()
     connection.close()
@@ -211,71 +234,75 @@ def classify_member(discord_id):
         return None, None
 
     joined_at = datetime.fromisoformat(joined_at_text)
-
     now = datetime.now(timezone.utc)
-    days_in_server = (now - joined_at).total_seconds() / 86400
 
-    # New member grace period
+    days_in_server = (
+        now - joined_at
+    ).total_seconds() / 86400
+
+    # New-member grace period
     if days_in_server < 7:
         return None, None
 
-    # Character sheet check
+    # Character-sheet requirement
     if not sheet_found:
-        return "PURGE", "No character sheet found after 7-day grace period."
+        return (
+            "PURGE",
+            "No character sheet found after 7-day grace period."
+        )
 
-    # IC activity
+    # Latest IC post OR latest character-sheet submission
     ic_age = get_ic_age_days(discord_id)
 
-    # Early warning: approaching the standard 14-day IC deadline.
+    # Approaching the 14-day deadline
     if ic_age is not None and 13 <= ic_age < 14:
         return (
             "WATCH",
-            "IC DEADLINE APPROACHING: Last qualifying IC post is "
-            "at least 13 but less than 14 days old. "
+            "IC DEADLINE APPROACHING: "
+            f"Last activity was {ic_age:.1f} days ago."
         )
 
-    # Everyone else with recent IC activity needs no activity-list entry.
+    # Normal IC requirement met
     if ic_age is not None and ic_age < 14:
         return None, None
 
-    # OOC activity
+    # OOC activity check
     ooc_count = count_recent_ooc_posts(discord_id)
 
     if ooc_count < OOC_REQUIRED_POSTS:
         if ic_age is None:
             reason = (
-                f"No qualifying IC activity found; "
+                "No qualifying IC activity found; "
                 f"{ooc_count} OOC posts in the last 14 days."
             )
         else:
             reason = (
-                f"Last qualifying IC activity was {ic_age:.1f} days ago; "
+                f"Last qualifying activity was {ic_age:.1f} days ago; "
                 f"{ooc_count} OOC posts in the last 14 days."
             )
 
         return "SORT", reason
 
-    # Extended IC window
+    # Extended IC inactivity allowance
     if ic_age is None:
         return (
             "PURGE",
-            f"No qualifying IC activity found; "
+            "No qualifying IC or character-sheet activity date found; "
             f"OOC requirement met with {ooc_count} posts."
         )
 
     if ic_age < 42:
         return (
             "WATCH",
-            f"Last qualifying IC activity was {ic_age:.1f} days ago; "
+            f"Last qualifying activity was {ic_age:.1f} days ago; "
             f"OOC requirement met with {ooc_count} posts."
         )
 
     return (
         "PURGE",
-        f"Last qualifying IC activity was {ic_age:.1f} days ago; "
-        f"42-day extended allowance exceeded."
+        f"Last qualifying activity was {ic_age:.1f} days ago; "
+        "42-day extended allowance exceeded."
     )
-
 # --------------------------------------------------
 # SHOW MEMBERS THAT HAVE LEFT
 # --------------------------------------------------
@@ -403,24 +430,46 @@ def save_ic_activity(message):
 # --------------------------------------------------
 def get_ic_age_days(discord_id):
     connection = sqlite3.connect("reaper.db")
-    cursor = connection.cursor()
 
-    cursor.execute("""
-        SELECT created_at
-        FROM ic_activity
-        WHERE discord_id = ?
-    """, (discord_id,))
+    try:
+        row = connection.execute("""
+            SELECT
+                m.sheet_submitted_at,
+                ic.created_at
+            FROM members AS m
 
-    row = cursor.fetchone()
-    connection.close()
+            LEFT JOIN ic_activity AS ic
+                ON m.discord_id = ic.discord_id
+
+            WHERE m.discord_id = ?
+        """, (discord_id,)).fetchone()
+
+    finally:
+        connection.close()
 
     if row is None:
         return None
 
-    created_at = datetime.fromisoformat(row[0])
-    now = datetime.now(timezone.utc)
+    sheet_date, ic_date = row
 
-    age = now - created_at
+    activity_dates = []
+
+    if sheet_date:
+        activity_dates.append(
+            datetime.fromisoformat(sheet_date)
+        )
+
+    if ic_date:
+        activity_dates.append(
+            datetime.fromisoformat(ic_date)
+        )
+
+    if not activity_dates:
+        return None
+
+    latest_activity = max(activity_dates)
+
+    age = datetime.now(timezone.utc) - latest_activity
 
     return age.total_seconds() / 86400
 
@@ -479,20 +528,33 @@ def count_recent_ooc_posts(discord_id):
 # FIND CHARACTER SHEET AND MARK IT FOUND
 # --------------------------------------------------
 
-def mark_sheet_found(discord_id):
+def mark_sheet_found(discord_id, submitted_at):
+    if submitted_at is None:
+        print(f"CS DATE MISSING | Member ID: {discord_id}")
+        return
+
     connection = sqlite3.connect("reaper.db")
-    cursor = connection.cursor()
 
-    cursor.execute("""
-        UPDATE members
-        SET sheet_checked = 1,
-            sheet_found = 1
-        WHERE discord_id = ?
-    """, (discord_id,))
+    try:
+        with connection:
+            connection.execute("""
+                UPDATE members
+                SET sheet_checked = 1,
+                    sheet_found = 1,
+                    sheet_submitted_at = ?
+                WHERE discord_id = ?
+                  AND (
+                      sheet_submitted_at IS NULL
+                      OR sheet_submitted_at < ?
+                  )
+            """, (
+                submitted_at.isoformat(),
+                discord_id,
+                submitted_at.isoformat()
+            ))
 
-    connection.commit()
-    connection.close()
-
+    finally:
+        connection.close()
 # --------------------------------------------------
 # GETTING MEMBER DATA
 # --------------------------------------------------
@@ -753,7 +815,7 @@ async def initial_scan_character_sheets(guild):
             if message.author.bot:
                 continue
 
-            mark_sheet_found(message.author.id)
+            mark_sheet_found(message.author.id, message.created_at)
 
     # Forum channel
     elif isinstance(channel, discord.ForumChannel):
@@ -763,14 +825,14 @@ async def initial_scan_character_sheets(guild):
             owner_id = thread.owner_id
 
             if owner_id is not None:
-                mark_sheet_found(owner_id)
+                mark_sheet_found(owner_id, thread.created_at)
 
         # Archived forum posts
         async for thread in channel.archived_threads(limit=None):
             owner_id = thread.owner_id
 
             if owner_id is not None:
-                mark_sheet_found(owner_id)
+                mark_sheet_found(owner_id, thread.created_at)
 
     else:
         print(
@@ -1115,15 +1177,24 @@ async def on_message(message):
         )
         return
 
-    # Keep character-sheet discussions separate.
+    # Character sheet activity
     if parent.id == CS_CHANNEL_ID:
-        print(
-            f"CHARACTER SHEET | "
-            f"{message.author.name} | "
-            f"Channel: {message.channel.name}"
-        )
-        return
 
+        # Direct posts in a regular text CS channel.
+        if (
+                isinstance(message.channel, discord.TextChannel)
+                and message.channel.id == CS_CHANNEL_ID
+        ):
+            mark_sheet_found(
+                message.author.id,
+                message.created_at
+            )
+
+            print(
+                f"CS FOUND | {message.author.display_name}"
+            )
+
+        return
     kind = get_activity_kind(message.channel)
 
     if kind == "IC":
@@ -1148,23 +1219,6 @@ async def on_message(message):
         # OOC activity is collected by the hourly history scan.
         return
 
-    # Character sheets are handled separately from IC/OOC activity.
-    if parent.id == CS_CHANNEL_ID:
-
-        # A direct message in the configured text CS channel.
-        if (
-            isinstance(message.channel, discord.TextChannel)
-            and message.channel.id == CS_CHANNEL_ID
-        ):
-            save_member(message.author)
-            mark_sheet_found(message.author.id)
-
-            print(
-                f"CS FOUND | "
-                f"{message.author.display_name}"
-            )
-
-        return
 
 # --------------------------------------------------
 # HANDLE NEW MEMBERS
@@ -1394,6 +1448,8 @@ async def on_ready():
     if client.guilds:
 
         for guild in client.guilds:
+            if guild.id != TEST_GUILD_ID:
+                continue
 
             print(f"Server: {guild.name} (ID: {guild.id})")
             print(f"Members found: {guild.member_count}")
